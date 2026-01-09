@@ -710,13 +710,29 @@ async def handle_client(websocket, path):
         print("Client disconnected")
 
 
+async def health_check(request):
+    return web.Response(text="OK")
+
 async def main():
     port = int(os.environ.get('PORT', 5555))
     print(f"Velora Server starting on port {port}...")
-    async with websockets.serve(handle_client, "0.0.0.0", port):
-        print(f"Server running!")
-        await asyncio.Future()
-
+    
+    # HTTP server for health check
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    # WebSocket server on different port internally
+    ws_server = await websockets.serve(handle_client, "0.0.0.0", 8765)
+    
+    print(f"Server running!")
+    await asyncio.Future()
 
 if __name__ == "__main__":
+    from aiohttp import web
     asyncio.run(main())
