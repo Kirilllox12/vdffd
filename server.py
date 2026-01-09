@@ -79,6 +79,14 @@ def init_db():
         created_at TEXT
     )''')
     
+    # Premium payment requests
+    c.execute('''CREATE TABLE IF NOT EXISTS premium_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT
+    )''')
+    
     db.commit()
     db.close()
 
@@ -819,21 +827,104 @@ async def process_message(msg, ws):
         await ws.send(json.dumps({'type': 'crystals_update', 'crystals': new_balance}))
         await send_to_user(to_user, {'type': 'crystals_update', 'crystals': to_balance})
 
-    # ===== BUY PREMIUM =====
-    elif t == 'buy_premium':
+    # ===== PREMIUM PAYMENT REQUEST =====
+    elif t == 'premium_payment_request':
         if not clients.get(ws):
             return
         user = clients[ws]
         
+        # Check if already has premium
         db = get_db()
         c = db.cursor()
-        c.execute('UPDATE users SET premium=1 WHERE username=?', (user['username'],))
+        c.execute('SELECT premium FROM users WHERE username=?', (user['username'],))
+        row = c.fetchone()
+        if row and row[0]:
+            db.close()
+            await ws.send(json.dumps({'type': 'error', 'error': 'У вас уже есть Premium'}))
+            return
+        
+        # Check if already has pending request
+        c.execute('SELECT 1 FROM premium_requests WHERE username=? AND status="pending"', (user['username'],))
+        if c.fetchone():
+            db.close()
+            await ws.send(json.dumps({'type': 'error', 'error': 'Заявка уже отправлена, ожидайте'}))
+            return
+        
+        # Create request
+        now = datetime.now().isoformat()
+        c.execute('INSERT INTO premium_requests (username, status, created_at) VALUES (?, "pending", ?)',
+                  (user['username'], now))
         db.commit()
         db.close()
         
-        user['premium'] = 1
-        clients[ws] = user
-        await ws.send(json.dumps({'type': 'premium_activated'}))
+        # Notify admins
+        for admin in ADMINS:
+            await send_to_user(admin, {'type': 'premium_request_received', 'username': user['username']})
+        
+        await ws.send(json.dumps({'type': 'payment_request_sent', 'success': True}))
+
+    # ===== GET PREMIUM REQUESTS (ADMIN) =====
+    elif t == 'get_premium_requests':
+        if not clients.get(ws):
+            return
+        user = clients[ws]
+        if user['username'] not in ADMINS:
+            return
+        
+        db = get_db()
+        c = db.cursor()
+        c.execute('SELECT username, created_at FROM premium_requests WHERE status="pending" ORDER BY created_at DESC')
+        requests = [{'username': r[0], 'created_at': r[1]} for r in c.fetchall()]
+        db.close()
+        
+        await ws.send(json.dumps({'type': 'premium_requests', 'requests': requests}, ensure_ascii=False))
+
+    # ===== APPROVE PREMIUM (ADMIN) =====
+    elif t == 'approve_premium':
+        if not clients.get(ws):
+            return
+        user = clients[ws]
+        if user['username'] not in ADMINS:
+            return
+        
+        target = msg.get('target', '').lower()
+        
+        db = get_db()
+        c = db.cursor()
+        
+        # Update request status
+        c.execute('UPDATE premium_requests SET status="approved" WHERE username=? AND status="pending"', (target,))
+        
+        # Give premium
+        c.execute('UPDATE users SET premium=1 WHERE username=?', (target,))
+        db.commit()
+        db.close()
+        
+        # Notify user
+        await send_to_user(target, {'type': 'premium_activated'})
+        
+        await ws.send(json.dumps({'type': 'admin_response', 'message': f'Premium выдан @{target}'}))
+
+    # ===== REJECT PREMIUM (ADMIN) =====
+    elif t == 'reject_premium':
+        if not clients.get(ws):
+            return
+        user = clients[ws]
+        if user['username'] not in ADMINS:
+            return
+        
+        target = msg.get('target', '').lower()
+        
+        db = get_db()
+        c = db.cursor()
+        c.execute('UPDATE premium_requests SET status="rejected" WHERE username=? AND status="pending"', (target,))
+        db.commit()
+        db.close()
+        
+        # Notify user
+        await send_to_user(target, {'type': 'premium_rejected', 'message': 'Заявка на Premium отклонена. Проверьте оплату.'})
+        
+        await ws.send(json.dumps({'type': 'admin_response', 'message': f'Заявка @{target} отклонена'}))
 
 
 # ===== SEND PRIVATE CHATS LIST =====
