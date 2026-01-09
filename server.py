@@ -5,7 +5,7 @@ import sqlite3
 import os
 from datetime import datetime
 
-db_path = '/tmp/velora.db'
+db_path = '/tmp/velora_v2.db'
 
 def get_db():
     return sqlite3.connect(db_path)
