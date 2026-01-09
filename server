@@ -1,0 +1,722 @@
+import asyncio
+import websockets
+import json
+import sqlite3
+import threading
+from datetime import datetime
+import os
+
+# Database setup
+db_path = os.path.join(os.path.dirname(__file__), 'velora.db')
+db = sqlite3.connect(db_path, check_same_thread=False)
+db_lock = threading.Lock()
+
+def init_db():
+    c = db.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL,
+        display_name TEXT,
+        bio TEXT DEFAULT '',
+        avatar_color TEXT DEFAULT '#a855f7',
+        avatar_data TEXT DEFAULT '',
+        crystals INTEGER DEFAULT 100,
+        premium INTEGER DEFAULT 0,
+        status TEXT DEFAULT '',
+        last_seen TEXT,
+        created_at TEXT,
+        is_online INTEGER DEFAULT 0,
+        is_frozen INTEGER DEFAULT 0,
+        is_banned INTEGER DEFAULT 0,
+        is_muted INTEGER DEFAULT 0,
+        is_deleted INTEGER DEFAULT 0,
+        is_verified INTEGER DEFAULT 0,
+        warns INTEGER DEFAULT 0,
+        shadow_banned INTEGER DEFAULT 0,
+        delete_reason TEXT DEFAULT '',
+        last_warn_reason TEXT DEFAULT '',
+        shadow_ban_reason TEXT DEFAULT '',
+        gifts TEXT DEFAULT '[]'
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY,
+        chat_type TEXT,
+        name TEXT,
+        description TEXT DEFAULT '',
+        avatar_color TEXT DEFAULT '#a855f7',
+        avatar_data TEXT DEFAULT '',
+        owner TEXT,
+        link TEXT UNIQUE,
+        is_public INTEGER DEFAULT 0,
+        created_at TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_members (
+        chat_id TEXT,
+        username TEXT,
+        role TEXT DEFAULT 'member',
+        joined_at TEXT,
+        PRIMARY KEY (chat_id, username)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT,
+        from_user TEXT,
+        text TEXT,
+        media_type TEXT DEFAULT '',
+        media_data TEXT DEFAULT '',
+        reply_to INTEGER,
+        forward_from TEXT DEFAULT '',
+        is_deleted INTEGER DEFAULT 0,
+        time TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS private_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_user TEXT,
+        to_user TEXT,
+        text TEXT,
+        media_type TEXT DEFAULT '',
+        media_data TEXT DEFAULT '',
+        reply_to INTEGER,
+        forward_from TEXT DEFAULT '',
+        is_deleted INTEGER DEFAULT 0,
+        time TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS reactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id INTEGER,
+        chat_id TEXT,
+        username TEXT,
+        emoji TEXT,
+        is_private INTEGER DEFAULT 0
+    )''')
+    
+    db.commit()
+
+init_db()
+
+# Connected clients: websocket -> user_data
+clients = {}
+
+def get_user_data(username):
+    with db_lock:
+        c = db.cursor()
+        c.execute('SELECT username, display_name, bio, avatar_color, avatar_data, crystals, premium, status, is_verified, is_frozen, gifts FROM users WHERE username = ?', (username,))
+        row = c.fetchone()
+        if row:
+            return {
+                'username': row[0],
+                'display_name': row[1] or row[0],
+                'bio': row[2] or '',
+                'avatar_color': row[3],
+                'avatar_data': row[4] or '',
+                'crystals': row[5],
+                'premium': bool(row[6]),
+                'status': row[7] or '',
+                'is_verified': bool(row[8]),
+                'is_frozen': bool(row[9]),
+                'gifts': json.loads(row[10] or '[]')
+            }
+    return None
+
+async def send_json(ws, data):
+    try:
+        await ws.send(json.dumps(data, ensure_ascii=False))
+    except:
+        pass
+
+async def send_to_user(username, data):
+    for ws, user in clients.items():
+        if user.get('username') == username:
+            await send_json(ws, data)
+            break
+
+async def broadcast_to_chat(chat_id, data, exclude=None):
+    with db_lock:
+        c = db.cursor()
+        c.execute('SELECT username FROM chat_members WHERE chat_id = ?', (chat_id,))
+        members = [r[0] for r in c.fetchall()]
+    
+    for ws, user in clients.items():
+        if user.get('username') in members and user.get('username') != exclude:
+            await send_json(ws, data)
+
+async def handle_message(ws, msg):
+    t = msg.get('type', '')
+    
+    # Register
+    if t == 'register':
+        username = msg.get('username', '').lower().strip()
+        password = msg.get('password', '')
+        display_name = msg.get('display_name', username)
+        avatar_color = msg.get('avatar_color', '#a855f7')
+        
+        if not username or not password:
+            await send_json(ws, {'type': 'register_response', 'success': False, 'error': 'Заполните все поля'})
+            return
+        
+        if len(username) < 3:
+            await send_json(ws, {'type': 'register_response', 'success': False, 'error': 'Минимум 3 символа'})
+            return
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+            if c.fetchone():
+                await send_json(ws, {'type': 'register_response', 'success': False, 'error': 'Имя занято'})
+                return
+            
+            c.execute('INSERT INTO users (username, password, display_name, avatar_color, created_at, is_online) VALUES (?, ?, ?, ?, ?, 1)',
+                     (username, password, display_name, avatar_color, datetime.now().isoformat()))
+            db.commit()
+        
+        user = get_user_data(username)
+        clients[ws] = user
+        await send_json(ws, {'type': 'register_response', 'success': True, 'user': user})
+        await send_json(ws, {'type': 'my_chats', 'chats': []})
+    
+    # Login
+    elif t == 'login':
+        username = msg.get('username', '').lower().strip()
+        password = msg.get('password', '')
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT username, is_deleted, is_banned, delete_reason FROM users WHERE username = ? AND password = ?', (username, password))
+            row = c.fetchone()
+            
+            if not row:
+                await send_json(ws, {'type': 'login_response', 'success': False, 'error': 'Неверные данные'})
+                return
+            
+            if row[1]:  # is_deleted
+                reason = row[3] or 'Нарушение правил'
+                await send_json(ws, {'type': 'login_response', 'success': False, 'error': f'Аккаунт удалён. Причина: {reason}'})
+                return
+            
+            if row[2]:  # is_banned
+                await send_json(ws, {'type': 'login_response', 'success': False, 'error': 'Аккаунт заблокирован'})
+                return
+            
+            c.execute('UPDATE users SET is_online = 1, last_seen = ? WHERE username = ?', (datetime.now().isoformat(), username))
+            db.commit()
+        
+        user = get_user_data(username)
+        clients[ws] = user
+        await send_json(ws, {'type': 'login_response', 'success': True, 'user': user})
+        
+        # Send chats
+        with db_lock:
+            c = db.cursor()
+            c.execute('''SELECT c.id, c.chat_type, c.name, c.description, c.avatar_color, c.owner, c.link, c.is_public, c.avatar_data
+                        FROM chats c JOIN chat_members m ON c.id = m.chat_id WHERE m.username = ?''', (username,))
+            chats = [{'id': r[0], 'type': r[1], 'name': r[2], 'description': r[3], 'avatar_color': r[4], 
+                     'owner': r[5], 'link': r[6], 'is_public': r[7], 'avatar_data': r[8] or ''} for r in c.fetchall()]
+        await send_json(ws, {'type': 'my_chats', 'chats': chats})
+    
+    # Create group/channel
+    elif t == 'create_chat':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        chat_type = msg.get('chat_type', 'group')
+        name = msg.get('name', 'Новый чат')
+        desc = msg.get('description', '')
+        is_public = msg.get('is_public', False)
+        avatar_color = msg.get('avatar_color', '#a855f7')
+        avatar_data = msg.get('avatar_data', '')
+        
+        import uuid
+        chat_id = str(uuid.uuid4())[:8]
+        link = f"velora_{chat_id}"
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('INSERT INTO chats (id, chat_type, name, description, avatar_color, avatar_data, owner, link, is_public, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                     (chat_id, chat_type, name, desc, avatar_color, avatar_data, user['username'], link, int(is_public), datetime.now().isoformat()))
+            c.execute('INSERT INTO chat_members (chat_id, username, role, joined_at) VALUES (?,?,?,?)',
+                     (chat_id, user['username'], 'owner', datetime.now().isoformat()))
+            db.commit()
+        
+        chat = {'id': chat_id, 'type': chat_type, 'name': name, 'description': desc, 'avatar_color': avatar_color,
+                'avatar_data': avatar_data, 'owner': user['username'], 'link': link, 'is_public': is_public}
+        await send_json(ws, {'type': 'chat_created', 'chat': chat})
+    
+    # Join chat
+    elif t == 'join_chat':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        link = msg.get('link', '').replace('velora_', '')
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT id, chat_type, name, description, avatar_color, owner, link, is_public, avatar_data FROM chats WHERE link LIKE ?', (f'%{link}%',))
+            row = c.fetchone()
+            if not row:
+                await send_json(ws, {'type': 'join_response', 'success': False, 'error': 'Чат не найден'})
+                return
+            
+            chat = {'id': row[0], 'type': row[1], 'name': row[2], 'description': row[3], 'avatar_color': row[4],
+                   'owner': row[5], 'link': row[6], 'is_public': row[7], 'avatar_data': row[8] or ''}
+            
+            c.execute('SELECT 1 FROM chat_members WHERE chat_id = ? AND username = ?', (chat['id'], user['username']))
+            already = c.fetchone() is not None
+            
+            if not already:
+                c.execute('INSERT INTO chat_members (chat_id, username, role, joined_at) VALUES (?,?,?,?)',
+                         (chat['id'], user['username'], 'member', datetime.now().isoformat()))
+                db.commit()
+        
+        await send_json(ws, {'type': 'join_response', 'success': True, 'chat': chat, 'already': already})
+    
+    # Chat message
+    elif t == 'chat_message':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        chat_id = msg.get('chat_id')
+        text = msg.get('text', '')
+        media_type = msg.get('media_type', '')
+        media_data = msg.get('media_data', '')
+        reply_to = msg.get('reply_to')
+        forward_from = msg.get('forward_from', '')
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('INSERT INTO messages (chat_id, from_user, text, media_type, media_data, reply_to, forward_from, time) VALUES (?,?,?,?,?,?,?,?)',
+                     (chat_id, user['username'], text, media_type, media_data, reply_to, forward_from, datetime.now().isoformat()))
+            msg_id = c.lastrowid
+            db.commit()
+        
+        broadcast_msg = {
+            'type': 'chat_message', 'id': msg_id, 'chat_id': chat_id, 'from': user['username'],
+            'text': text, 'media_type': media_type, 'media_data': media_data,
+            'reply_to': reply_to, 'forward_from': forward_from, 'time': datetime.now().isoformat(),
+            'avatar_color': user.get('avatar_color', '#a855f7')
+        }
+        await broadcast_to_chat(chat_id, broadcast_msg)
+    
+    # Get chat history
+    elif t == 'get_chat_history':
+        if ws not in clients:
+            return
+        chat_id = msg.get('chat_id')
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('''SELECT m.id, m.from_user, m.text, m.media_type, m.media_data, m.reply_to, m.forward_from, m.is_deleted, m.time, u.avatar_color
+                        FROM messages m LEFT JOIN users u ON m.from_user = u.username
+                        WHERE m.chat_id = ? ORDER BY m.id DESC LIMIT 100''', (chat_id,))
+            messages = []
+            for r in c.fetchall():
+                msg_data = {'id': r[0], 'from': r[1], 'text': r[2], 'media_type': r[3], 'media_data': r[4],
+                           'reply_to': r[5], 'forward_from': r[6], 'is_deleted': bool(r[7]), 'time': r[8], 'avatar_color': r[9] or '#a855f7'}
+                # Get reactions
+                c.execute('SELECT emoji, username FROM reactions WHERE message_id = ? AND chat_id = ?', (r[0], chat_id))
+                reactions = {}
+                for er in c.fetchall():
+                    if er[0] not in reactions:
+                        reactions[er[0]] = []
+                    reactions[er[0]].append(er[1])
+                msg_data['reactions'] = reactions
+                messages.append(msg_data)
+        
+        messages.reverse()
+        await send_json(ws, {'type': 'chat_history', 'chat_id': chat_id, 'messages': messages})
+    
+    # Private message
+    elif t == 'private_message':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        to_user = msg.get('to', '').lower()
+        text = msg.get('text', '')
+        media_type = msg.get('media_type', '')
+        media_data = msg.get('media_data', '')
+        reply_to = msg.get('reply_to')
+        forward_from = msg.get('forward_from', '')
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('INSERT INTO private_messages (from_user, to_user, text, media_type, media_data, reply_to, forward_from, time) VALUES (?,?,?,?,?,?,?,?)',
+                     (user['username'], to_user, text, media_type, media_data, reply_to, forward_from, datetime.now().isoformat()))
+            msg_id = c.lastrowid
+            db.commit()
+        
+        pm = {'type': 'private_message', 'id': msg_id, 'from': user['username'], 'to': to_user,
+              'text': text, 'media_type': media_type, 'media_data': media_data,
+              'reply_to': reply_to, 'forward_from': forward_from, 'time': datetime.now().isoformat(),
+              'avatar_color': user.get('avatar_color', '#a855f7')}
+        
+        await send_json(ws, pm)
+        await send_to_user(to_user, pm)
+    
+    # Get private history
+    elif t == 'get_private_history':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        with_user = msg.get('with', '').lower()
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('''SELECT p.id, p.from_user, p.to_user, p.text, p.media_type, p.media_data, p.reply_to, p.forward_from, p.is_deleted, p.time, u.avatar_color
+                        FROM private_messages p LEFT JOIN users u ON p.from_user = u.username
+                        WHERE (p.from_user = ? AND p.to_user = ?) OR (p.from_user = ? AND p.to_user = ?)
+                        ORDER BY p.id DESC LIMIT 100''', (user['username'], with_user, with_user, user['username']))
+            messages = [{'id': r[0], 'from': r[1], 'to': r[2], 'text': r[3], 'media_type': r[4], 'media_data': r[5],
+                        'reply_to': r[6], 'forward_from': r[7], 'is_deleted': bool(r[8]), 'time': r[9], 'avatar_color': r[10] or '#a855f7'} for r in c.fetchall()]
+        
+        messages.reverse()
+        await send_json(ws, {'type': 'private_history', 'with': with_user, 'messages': messages})
+    
+    # Search
+    elif t == 'search':
+        query = msg.get('query', '').lower()
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT username, display_name, avatar_color, avatar_data, premium, is_verified, is_frozen, is_deleted, is_online FROM users WHERE username LIKE ? LIMIT 20', (f'%{query}%',))
+            users = [{'username': r[0], 'display_name': r[1], 'avatar_color': r[2], 'avatar_data': r[3] or '',
+                     'premium': bool(r[4]), 'is_verified': bool(r[5]), 'is_frozen': bool(r[6]), 'is_deleted': bool(r[7]), 'is_online': bool(r[8])} for r in c.fetchall()]
+            
+            c.execute('SELECT id, chat_type, name, avatar_color, avatar_data, link FROM chats WHERE is_public = 1 AND name LIKE ? LIMIT 10', (f'%{query}%',))
+            chats = [{'id': r[0], 'type': r[1], 'name': r[2], 'avatar_color': r[3], 'avatar_data': r[4] or '', 'link': r[5]} for r in c.fetchall()]
+        
+        await send_json(ws, {'type': 'search_results', 'results': {'users': users, 'chats': chats}})
+    
+    # Get user profile
+    elif t == 'get_user_profile':
+        username = msg.get('username', '').lower()
+        user = get_user_data(username)
+        if user:
+            await send_json(ws, {'type': 'user_profile', 'user': user})
+    
+    # Update profile
+    elif t == 'update_profile':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        display_name = msg.get('display_name', user['display_name'])
+        bio = msg.get('bio', '')
+        avatar_data = msg.get('avatar_data', '')
+        
+        with db_lock:
+            c = db.cursor()
+            if avatar_data:
+                c.execute('UPDATE users SET display_name = ?, bio = ?, avatar_data = ? WHERE username = ?',
+                         (display_name, bio, avatar_data, user['username']))
+            else:
+                c.execute('UPDATE users SET display_name = ?, bio = ? WHERE username = ?',
+                         (display_name, bio, user['username']))
+            db.commit()
+        
+        updated = get_user_data(user['username'])
+        clients[ws] = updated
+        await send_json(ws, {'type': 'profile_updated', 'success': True, 'user': updated})
+    
+    # Add reaction
+    elif t == 'add_reaction':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        message_id = msg.get('message_id')
+        chat_id = msg.get('chat_id')
+        emoji = msg.get('emoji')
+        is_private = msg.get('is_private', False)
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT 1 FROM reactions WHERE message_id = ? AND username = ? AND emoji = ?', (message_id, user['username'], emoji))
+            if not c.fetchone():
+                c.execute('INSERT INTO reactions (message_id, chat_id, username, emoji, is_private) VALUES (?,?,?,?,?)',
+                         (message_id, chat_id, user['username'], emoji, int(is_private)))
+                db.commit()
+        
+        reaction_msg = {'type': 'reaction_added', 'message_id': message_id, 'emoji': emoji, 'username': user['username']}
+        if is_private:
+            await send_json(ws, reaction_msg)
+        else:
+            await broadcast_to_chat(chat_id, reaction_msg)
+    
+    # Delete message
+    elif t == 'delete_message':
+        if ws not in clients:
+            return
+        message_id = msg.get('message_id')
+        is_private = msg.get('is_private', False)
+        
+        with db_lock:
+            c = db.cursor()
+            if is_private:
+                c.execute('UPDATE private_messages SET is_deleted = 1, text = "[Удалено]" WHERE id = ?', (message_id,))
+            else:
+                c.execute('UPDATE messages SET is_deleted = 1, text = "[Удалено]" WHERE id = ?', (message_id,))
+            db.commit()
+        
+        await send_json(ws, {'type': 'message_deleted', 'message_id': message_id})
+    
+    # Transfer crystals
+    elif t == 'transfer_crystals':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        to_user = msg.get('to', '').lower()
+        amount = msg.get('amount', 0)
+        
+        if amount <= 0:
+            return
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT crystals FROM users WHERE username = ?', (user['username'],))
+            row = c.fetchone()
+            if not row or row[0] < amount:
+                await send_json(ws, {'type': 'error', 'message': 'Недостаточно кристаллов'})
+                return
+            
+            c.execute('UPDATE users SET crystals = crystals - ? WHERE username = ?', (amount, user['username']))
+            c.execute('UPDATE users SET crystals = crystals + ? WHERE username = ?', (amount, to_user))
+            db.commit()
+            
+            c.execute('SELECT crystals FROM users WHERE username = ?', (user['username'],))
+            new_crystals = c.fetchone()[0]
+        
+        clients[ws]['crystals'] = new_crystals
+        await send_json(ws, {'type': 'crystals_update', 'crystals': new_crystals})
+        await send_to_user(to_user, {'type': 'crystals_received', 'amount': amount, 'from': user['username']})
+    
+    # Send gift
+    elif t == 'send_gift':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        to_user = msg.get('to', '').lower()
+        gift_id = msg.get('gift_id', '')
+        
+        gift_prices = {'heart': 5, 'fire': 8, 'star': 15, 'kiss': 12, 'rose': 20, 'crown': 50, 'diamond': 100, 'rocket': 60, 'rainbow': 45, 'cake': 25, 'cat': 15, 'gift': 35}
+        price = gift_prices.get(gift_id, 0)
+        if user.get('premium'):
+            price = int(price * 0.8)
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT crystals FROM users WHERE username = ?', (user['username'],))
+            row = c.fetchone()
+            if not row or row[0] < price:
+                await send_json(ws, {'type': 'error', 'message': 'Недостаточно кристаллов'})
+                return
+            
+            c.execute('UPDATE users SET crystals = crystals - ? WHERE username = ?', (price, user['username']))
+            
+            c.execute('SELECT gifts FROM users WHERE username = ?', (to_user,))
+            row = c.fetchone()
+            if row:
+                gifts = json.loads(row[0] or '[]')
+                gifts.append({'id': gift_id, 'from': user['username'], 'time': datetime.now().isoformat()})
+                c.execute('UPDATE users SET gifts = ? WHERE username = ?', (json.dumps(gifts), to_user))
+            
+            db.commit()
+            
+            c.execute('SELECT crystals FROM users WHERE username = ?', (user['username'],))
+            new_crystals = c.fetchone()[0]
+        
+        clients[ws]['crystals'] = new_crystals
+        await send_json(ws, {'type': 'crystals_update', 'crystals': new_crystals})
+        await send_to_user(to_user, {'type': 'gift_received', 'from': user['username'], 'gift_id': gift_id})
+
+    # Buy premium
+    elif t == 'buy_premium':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('UPDATE users SET premium = 1 WHERE username = ?', (user['username'],))
+            db.commit()
+        
+        clients[ws]['premium'] = True
+        await send_json(ws, {'type': 'premium_activated'})
+    
+    # Admin actions
+    elif t == 'admin_action':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        if user['username'] != 'maloy':
+            await send_json(ws, {'type': 'admin_response', 'message': 'Нет доступа'})
+            return
+        
+        action = msg.get('action', '')
+        target = msg.get('target', '').lower()
+        
+        with db_lock:
+            c = db.cursor()
+            
+            if action == 'freeze':
+                c.execute('UPDATE users SET is_frozen = 1 WHERE username = ?', (target,))
+                response = f'{target} заморожен'
+            elif action == 'unfreeze':
+                c.execute('UPDATE users SET is_frozen = 0 WHERE username = ?', (target,))
+                response = f'{target} разморожен'
+            elif action == 'delete':
+                reason = msg.get('reason', 'Нарушение правил')
+                c.execute('UPDATE users SET is_deleted = 1, delete_reason = ? WHERE username = ?', (reason, target))
+                response = f'{target} удалён: {reason}'
+            elif action == 'ban':
+                c.execute('UPDATE users SET is_banned = 1 WHERE username = ?', (target,))
+                response = f'{target} забанен'
+            elif action == 'unban':
+                c.execute('UPDATE users SET is_banned = 0 WHERE username = ?', (target,))
+                response = f'{target} разбанен'
+            elif action == 'warn':
+                reason = msg.get('reason', 'Нарушение')
+                c.execute('UPDATE users SET warns = warns + 1, last_warn_reason = ? WHERE username = ?', (reason, target))
+                response = f'Предупреждение {target}: {reason}'
+            elif action == 'give_premium':
+                c.execute('UPDATE users SET premium = 1 WHERE username = ?', (target,))
+                response = f'Premium выдан {target}'
+            elif action == 'remove_premium':
+                c.execute('UPDATE users SET premium = 0 WHERE username = ?', (target,))
+                response = f'Premium убран у {target}'
+            elif action == 'give_crystals':
+                amount = msg.get('amount', 100)
+                c.execute('UPDATE users SET crystals = crystals + ? WHERE username = ?', (amount, target))
+                response = f'Выдано {amount} кристаллов {target}'
+            elif action == 'reset_crystals':
+                c.execute('UPDATE users SET crystals = 0 WHERE username = ?', (target,))
+                response = f'Кристаллы обнулены у {target}'
+            elif action == 'change_name':
+                new_name = msg.get('new_name', target)
+                c.execute('UPDATE users SET display_name = ? WHERE username = ?', (new_name, target))
+                response = f'Имя изменено на {new_name}'
+            elif action == 'change_username':
+                new_username = msg.get('new_username', '').lower()
+                c.execute('SELECT 1 FROM users WHERE username = ?', (new_username,))
+                if c.fetchone():
+                    response = f'@{new_username} уже занят'
+                else:
+                    c.execute('UPDATE users SET username = ? WHERE username = ?', (new_username, target))
+                    c.execute('UPDATE messages SET from_user = ? WHERE from_user = ?', (new_username, target))
+                    c.execute('UPDATE private_messages SET from_user = ? WHERE from_user = ?', (new_username, target))
+                    c.execute('UPDATE private_messages SET to_user = ? WHERE to_user = ?', (new_username, target))
+                    response = f'@{target} -> @{new_username}'
+            elif action == 'verify':
+                c.execute('UPDATE users SET is_verified = 1 WHERE username = ?', (target,))
+                response = f'{target} верифицирован'
+            elif action == 'unverify':
+                c.execute('UPDATE users SET is_verified = 0 WHERE username = ?', (target,))
+                response = f'Верификация снята с {target}'
+            elif action == 'shadow_ban':
+                reason = msg.get('reason', 'Нарушение')
+                c.execute('UPDATE users SET shadow_banned = 1, shadow_ban_reason = ? WHERE username = ?', (reason, target))
+                response = f'{target} в теневом бане'
+            elif action == 'unshadow_ban':
+                c.execute('UPDATE users SET shadow_banned = 0 WHERE username = ?', (target,))
+                response = f'Теневой бан снят с {target}'
+            elif action == 'give_gift':
+                gift_id = msg.get('gift_id', '')
+                c.execute('SELECT gifts FROM users WHERE username = ?', (target,))
+                row = c.fetchone()
+                if row:
+                    gifts = json.loads(row[0] or '[]')
+                    gifts.append({'id': gift_id, 'from': 'Администрация', 'time': datetime.now().isoformat()})
+                    c.execute('UPDATE users SET gifts = ? WHERE username = ?', (json.dumps(gifts), target))
+                    response = f'Подарок {gift_id} выдан {target}'
+                else:
+                    response = 'Пользователь не найден'
+            elif action == 'view_info':
+                c.execute('SELECT username, password, display_name, crystals, premium, warns, is_frozen, is_banned FROM users WHERE username = ?', (target,))
+                row = c.fetchone()
+                if row:
+                    response = f'@{row[0]} | Пароль: {row[1]} | Имя: {row[2]} | Кристаллы: {row[3]} | Premium: {row[4]} | Warns: {row[5]}'
+                else:
+                    response = 'Не найден'
+            elif action == 'kick_all_chats':
+                c.execute('DELETE FROM chat_members WHERE username = ? AND role != "owner"', (target,))
+                response = f'{target} удалён из всех чатов'
+            else:
+                response = 'Неизвестная команда'
+            
+            db.commit()
+        
+        await send_json(ws, {'type': 'admin_response', 'message': response})
+    
+    # Admin stats
+    elif t == 'admin_get_stats':
+        if ws not in clients:
+            return
+        user = clients[ws]
+        if user['username'] != 'maloy':
+            return
+        
+        with db_lock:
+            c = db.cursor()
+            c.execute('SELECT COUNT(*) FROM users')
+            total_users = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM users WHERE is_online = 1')
+            online_users = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM chats')
+            total_chats = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM messages')
+            total_messages = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM users WHERE premium = 1')
+            premium_users = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM users WHERE is_frozen = 1')
+            frozen_users = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM users WHERE is_banned = 1')
+            banned_users = c.fetchone()[0]
+        
+        await send_json(ws, {
+            'type': 'admin_stats',
+            'total_users': total_users,
+            'online_users': online_users,
+            'total_chats': total_chats,
+            'total_messages': total_messages,
+            'premium_users': premium_users,
+            'frozen_users': frozen_users,
+            'banned_users': banned_users
+        })
+
+
+async def handle_client(websocket, path):
+    print(f"Client connected")
+    try:
+        async for message in websocket:
+            try:
+                msg = json.loads(message)
+                await handle_message(websocket, msg)
+            except json.JSONDecodeError:
+                print("Invalid JSON")
+            except Exception as e:
+                print(f"Error: {e}")
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        if websocket in clients:
+            user = clients[websocket]
+            with db_lock:
+                c = db.cursor()
+                c.execute('UPDATE users SET is_online = 0, last_seen = ? WHERE username = ?', 
+                         (datetime.now().isoformat(), user.get('username', '')))
+                db.commit()
+            del clients[websocket]
+        print("Client disconnected")
+
+
+async def main():
+    port = int(os.environ.get('PORT', 5555))
+    print(f"Velora Server starting on port {port}...")
+    async with websockets.serve(handle_client, "0.0.0.0", port):
+        print(f"Server running!")
+        await asyncio.Future()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
