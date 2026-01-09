@@ -195,8 +195,19 @@ async def process_message(msg, ws):
         display_name = msg.get('display_name', username)
         avatar_color = msg.get('avatar_color', '#a855f7')
         
+        # Validate username: only english letters, numbers, underscore, 3-15 chars
+        import re
         if not username or len(username) < 3:
             await ws.send(json.dumps({'type': 'register_response', 'success': False, 'error': 'Минимум 3 символа'}))
+            return
+        if len(username) > 15:
+            await ws.send(json.dumps({'type': 'register_response', 'success': False, 'error': 'Максимум 15 символов'}))
+            return
+        if not re.match(r'^[a-z0-9_]+$', username):
+            await ws.send(json.dumps({'type': 'register_response', 'success': False, 'error': 'Только английские буквы, цифры и _'}))
+            return
+        if '@' in username:
+            await ws.send(json.dumps({'type': 'register_response', 'success': False, 'error': 'Символ @ запрещён'}))
             return
         if not password or len(password) < 4:
             await ws.send(json.dumps({'type': 'register_response', 'success': False, 'error': 'Пароль минимум 4 символа'}))
@@ -211,14 +222,16 @@ async def process_message(msg, ws):
             return
         
         now = datetime.now().isoformat()
-        c.execute('INSERT INTO users (username, password, display_name, avatar_color, created_at) VALUES (?,?,?,?,?)',
-                  (username, password, display_name, avatar_color, now))
+        session_token = str(uuid.uuid4())
+        c.execute('INSERT INTO users (username, password, display_name, avatar_color, session_token, created_at) VALUES (?,?,?,?,?,?)',
+                  (username, password, display_name, avatar_color, session_token, now))
         db.commit()
         db.close()
         
         user = {'username': username, 'display_name': display_name, 'crystals': 100, 'premium': 0, 'avatar_color': avatar_color}
         clients[ws] = user
         await ws.send(json.dumps({'type': 'register_response', 'success': True, 'user': user}, ensure_ascii=False))
+        await ws.send(json.dumps({'type': 'session_token', 'token': session_token, 'username': username}))
         await send_private_chats(ws, username)
         await send_my_chats(ws, username)
 
@@ -246,7 +259,17 @@ async def process_message(msg, ws):
         
         user = {'username': row[0], 'display_name': row[1], 'crystals': row[2], 'premium': row[3], 'avatar_color': row[4], 'bio': row[5] or ''}
         clients[ws] = user
+        
+        # Generate new session token
+        session_token = str(uuid.uuid4())
+        db = get_db()
+        c = db.cursor()
+        c.execute('UPDATE users SET session_token=? WHERE username=?', (session_token, username))
+        db.commit()
+        db.close()
+        
         await ws.send(json.dumps({'type': 'login_response', 'success': True, 'user': user}, ensure_ascii=False))
+        await ws.send(json.dumps({'type': 'session_token', 'token': session_token, 'username': username}))
         await send_private_chats(ws, username)
         await send_my_chats(ws, username)
 
@@ -377,6 +400,13 @@ async def process_message(msg, ws):
         
         db = get_db()
         c = db.cursor()
+        
+        # Get sender's avatar
+        c.execute('SELECT avatar_color, avatar_data FROM users WHERE username=?', (user['username'],))
+        sender_row = c.fetchone()
+        sender_avatar_color = sender_row[0] if sender_row else '#a855f7'
+        sender_avatar_data = sender_row[1] if sender_row else ''
+        
         c.execute('''INSERT INTO chat_messages (chat_id, from_user, text, media_type, media_data, reply_to, forward_from, time)
                      VALUES (?,?,?,?,?,?,?,?)''',
                   (chat_id, user['username'], text, media_type, media_data, reply_to, forward_from, now))
@@ -389,7 +419,7 @@ async def process_message(msg, ws):
         chat_msg = {'type': 'chat_message', 'id': msg_id, 'chat_id': chat_id, 'from': user['username'],
                     'text': text, 'media_type': media_type, 'media_data': media_data,
                     'reply_to': reply_to, 'forward_from': forward_from, 'time': now,
-                    'avatar_color': user.get('avatar_color', '#a855f7')}
+                    'avatar_color': sender_avatar_color, 'avatar_data': sender_avatar_data}
         
         for member in members:
             await send_to_user(member, chat_msg)
@@ -402,13 +432,13 @@ async def process_message(msg, ws):
         
         db = get_db()
         c = db.cursor()
-        c.execute('''SELECT m.id, m.from_user, m.text, m.media_type, m.media_data, m.reply_to, m.forward_from, m.time, u.avatar_color
+        c.execute('''SELECT m.id, m.from_user, m.text, m.media_type, m.media_data, m.reply_to, m.forward_from, m.time, u.avatar_color, u.avatar_data
                      FROM chat_messages m LEFT JOIN users u ON m.from_user = u.username
                      WHERE m.chat_id=? ORDER BY m.id DESC LIMIT 100''', (chat_id,))
         messages = []
         for r in c.fetchall():
             msg_data = {'id': r[0], 'from': r[1], 'text': r[2], 'media_type': r[3], 'media_data': r[4],
-                       'reply_to': r[5], 'forward_from': r[6], 'time': r[7], 'avatar_color': r[8] or '#a855f7'}
+                       'reply_to': r[5], 'forward_from': r[6], 'time': r[7], 'avatar_color': r[8] or '#a855f7', 'avatar_data': r[9] or ''}
             c.execute('SELECT username, emoji FROM reactions WHERE message_id=? AND is_private=0', (r[0],))
             reactions = {}
             for rr in c.fetchall():
@@ -430,8 +460,10 @@ async def process_message(msg, ws):
         user = clients[ws]
         to_user = msg.get('to', '').lower()
         text = msg.get('text', '')
+        media_type = msg.get('media_type', '')
+        media_data = msg.get('media_data', '')
         
-        if not text or not to_user:
+        if (not text and not media_data) or not to_user:
             return
         
         now = datetime.now().isoformat()
@@ -451,6 +483,13 @@ async def process_message(msg, ws):
         
         db = get_db()
         c = db.cursor()
+        
+        # Get sender's avatar
+        c.execute('SELECT avatar_color, avatar_data FROM users WHERE username=?', (user['username'],))
+        sender_row = c.fetchone()
+        sender_avatar_color = sender_row[0] if sender_row else '#a855f7'
+        sender_avatar_data = sender_row[1] if sender_row else ''
+        
         c.execute('SELECT 1 FROM users WHERE username=?', (to_user,))
         if not c.fetchone():
             db.close()
@@ -461,17 +500,21 @@ async def process_message(msg, ws):
                   (user['username'], to_user, text, now))
         msg_id = c.lastrowid
         
+        preview = text[:50] if text else '[Медиа]'
         c.execute('INSERT OR REPLACE INTO private_chats (user1, user2, last_message, last_time) VALUES (?,?,?,?)',
-                  (user['username'], to_user, text[:50], now))
+                  (user['username'], to_user, preview, now))
         c.execute('INSERT OR REPLACE INTO private_chats (user1, user2, last_message, last_time) VALUES (?,?,?,?)',
-                  (to_user, user['username'], text[:50], now))
+                  (to_user, user['username'], preview, now))
         db.commit()
         db.close()
         
-        pm = {'type': 'private_message', 'id': msg_id, 'from': user['username'], 'to': to_user, 'text': text, 'time': now}
+        pm = {'type': 'private_message', 'id': msg_id, 'from': user['username'], 'to': to_user, 
+              'text': text, 'media_type': media_type, 'media_data': media_data, 'time': now,
+              'avatar_color': sender_avatar_color, 'avatar_data': sender_avatar_data}
         await ws.send(json.dumps(pm, ensure_ascii=False))
         await send_to_user(to_user, pm)
         
+        # Send updated chat list to recipient
         for client_ws, client_user in clients.items():
             if client_user and client_user.get('username') == to_user:
                 await send_private_chats(client_ws, to_user)
@@ -485,11 +528,14 @@ async def process_message(msg, ws):
         
         db = get_db()
         c = db.cursor()
-        c.execute('''SELECT id, from_user, to_user, text, time FROM private_messages 
-                     WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)
-                     ORDER BY id DESC LIMIT 100''',
+        c.execute('''SELECT pm.id, pm.from_user, pm.to_user, pm.text, pm.time, u.avatar_color, u.avatar_data
+                     FROM private_messages pm 
+                     LEFT JOIN users u ON pm.from_user = u.username
+                     WHERE (pm.from_user=? AND pm.to_user=?) OR (pm.from_user=? AND pm.to_user=?)
+                     ORDER BY pm.id DESC LIMIT 100''',
                   (user['username'], with_user, with_user, user['username']))
-        messages = [{'id': r[0], 'from': r[1], 'to': r[2], 'text': r[3], 'time': r[4]} for r in c.fetchall()]
+        messages = [{'id': r[0], 'from': r[1], 'to': r[2], 'text': r[3], 'time': r[4], 
+                    'avatar_color': r[5] or '#667eea', 'avatar_data': r[6] or ''} for r in c.fetchall()]
         db.close()
         
         messages.reverse()
