@@ -162,8 +162,17 @@ async def send_my_chats(ws, username):
     c = db.cursor()
     c.execute('''SELECT c.id, c.name, c.description, c.chat_type, c.owner, c.avatar_color, c.avatar_data, c.link, c.is_public
                  FROM chats c JOIN chat_members m ON c.id = m.chat_id WHERE m.username=?''', (username,))
-    chats = [{'id': r[0], 'name': r[1], 'description': r[2], 'type': r[3], 'owner': r[4], 
-              'avatar_color': r[5], 'avatar_data': r[6], 'link': r[7], 'is_public': r[8]} for r in c.fetchall()]
+    chats = []
+    for r in c.fetchall():
+        chat_id = r[0]
+        # Get members for this chat
+        c.execute('SELECT username FROM chat_members WHERE chat_id=?', (chat_id,))
+        members = [row[0] for row in c.fetchall()]
+        chats.append({
+            'id': chat_id, 'name': r[1], 'description': r[2], 'type': r[3], 'owner': r[4], 
+            'avatar_color': r[5], 'avatar_data': r[6], 'link': r[7], 'is_public': r[8],
+            'members': members
+        })
     db.close()
     await ws.send(json.dumps({'type': 'my_chats', 'chats': chats}, ensure_ascii=False))
 
@@ -380,6 +389,33 @@ async def process_message(msg, ws):
         db.close()
         
         await ws.send(json.dumps({'type': 'left_chat', 'chat_id': chat_id}))
+
+    # ===== DELETE CHAT =====
+    elif t == 'delete_chat':
+        if not clients.get(ws):
+            return
+        user = clients[ws]
+        chat_id = msg.get('chat_id', '')
+        
+        db = get_db()
+        c = db.cursor()
+        
+        # Check if user is owner
+        c.execute('SELECT owner FROM chats WHERE id=?', (chat_id,))
+        row = c.fetchone()
+        if not row or row[0] != user['username']:
+            await ws.send(json.dumps({'type': 'error', 'error': 'Только создатель может удалить чат'}))
+            db.close()
+            return
+        
+        # Delete chat and all related data
+        c.execute('DELETE FROM chat_messages WHERE chat_id=?', (chat_id,))
+        c.execute('DELETE FROM chat_members WHERE chat_id=?', (chat_id,))
+        c.execute('DELETE FROM chats WHERE id=?', (chat_id,))
+        db.commit()
+        db.close()
+        
+        await ws.send(json.dumps({'type': 'chat_deleted', 'chat_id': chat_id}))
 
     # ===== CHAT MESSAGE =====
     elif t == 'chat_message':
