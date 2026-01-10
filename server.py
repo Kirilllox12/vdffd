@@ -417,6 +417,36 @@ async def process_message(msg, ws):
         
         await ws.send(json.dumps({'type': 'chat_deleted', 'chat_id': chat_id}))
 
+    # ===== UPDATE CHAT =====
+    elif t == 'update_chat':
+        if not clients.get(ws):
+            return
+        user = clients[ws]
+        chat_id = msg.get('chat_id', '')
+        name = msg.get('name', '').strip()
+        description = msg.get('description', '').strip()
+        
+        if not chat_id or not name:
+            return
+        
+        db = get_db()
+        c = db.cursor()
+        
+        # Check if user is owner
+        c.execute('SELECT owner FROM chats WHERE id=?', (chat_id,))
+        row = c.fetchone()
+        if not row or row[0] != user['username']:
+            await ws.send(json.dumps({'type': 'error', 'error': 'Только создатель может редактировать чат'}))
+            db.close()
+            return
+        
+        # Update chat
+        c.execute('UPDATE chats SET name=?, description=? WHERE id=?', (name, description, chat_id))
+        db.commit()
+        db.close()
+        
+        await ws.send(json.dumps({'type': 'chat_updated', 'chat_id': chat_id, 'name': name, 'description': description}))
+
     # ===== CHAT MESSAGE =====
     elif t == 'chat_message':
         if not clients.get(ws):
