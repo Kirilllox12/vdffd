@@ -663,6 +663,8 @@ async def process_message(msg, ws):
         
         db = get_db()
         c = db.cursor()
+        
+        # Search users
         c.execute('SELECT username, display_name, bio, avatar_color, premium, is_verified, is_deleted FROM users WHERE username LIKE ? LIMIT 20', (f'%{query}%',))
         for row in c.fetchall():
             if not row[6]:
@@ -671,6 +673,7 @@ async def process_message(msg, ws):
                     'avatar_color': row[3], 'premium': row[4], 'is_verified': row[5]
                 })
         
+        # Search by aliases
         c.execute('SELECT owner FROM user_aliases WHERE alias LIKE ?', (f'%{query}%',))
         for row in c.fetchall():
             owner = row[0]
@@ -682,6 +685,20 @@ async def process_message(msg, ws):
                         'username': urow[0], 'display_name': urow[1], 'bio': urow[2] or '',
                         'avatar_color': urow[3], 'premium': urow[4], 'is_verified': urow[5]
                     })
+        
+        # Search public groups/channels by name
+        c.execute('''SELECT id, name, description, chat_type, owner, avatar_color, avatar_data, link 
+                     FROM chats WHERE is_public=1 AND name LIKE ? LIMIT 10''', (f'%{query}%',))
+        for row in c.fetchall():
+            # Get member count
+            c.execute('SELECT COUNT(*) FROM chat_members WHERE chat_id=?', (row[0],))
+            member_count = c.fetchone()[0]
+            results['chats'].append({
+                'id': row[0], 'name': row[1], 'description': row[2] or '', 
+                'type': row[3], 'owner': row[4], 'avatar_color': row[5],
+                'avatar_data': row[6], 'link': row[7], 'members_count': member_count
+            })
+        
         db.close()
         
         await ws.send(json.dumps({'type': 'search_results', 'results': results}, ensure_ascii=False))
