@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+vox_database.db
+vox_config.json
+*.log
+.env
+dist/
+build/
+*.spec
